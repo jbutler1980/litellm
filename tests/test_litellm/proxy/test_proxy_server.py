@@ -11199,7 +11199,9 @@ class TestEmbeddingsFailureHookRequestData:
 
 class TestEmbeddingsRejectAmbiguousNonce:
     @pytest.mark.asyncio
-    async def test_rejects_duplicate_raw_nonce_headers_before_body_processing(self):
+    async def test_rejects_duplicate_raw_nonce_headers_through_failure_audit(self):
+        from litellm.proxy._types import ProxyException
+
         request = Request(
             {
                 "type": "http",
@@ -11210,15 +11212,34 @@ class TestEmbeddingsRejectAmbiguousNonce:
             }
         )
 
-        with pytest.raises(proxy_server_module.HTTPException) as raised:
-            await proxy_server_module.embeddings(
-                request=request,
-                fastapi_response=MagicMock(),
-                user_api_key_dict=UserAPIKeyAuth(),
-            )
+        with (
+            patch.object(
+                proxy_server_module,
+                "_read_request_body",
+                new=AsyncMock(side_effect=AssertionError("body must not be read")),
+            ),
+            patch.object(proxy_server_module, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock(return_value=None)
+            mock_logging.post_call_response_headers_hook = AsyncMock(return_value={})
+            with pytest.raises(ProxyException) as raised:
+                await proxy_server_module.embeddings(
+                    request=request,
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=UserAPIKeyAuth(),
+                )
 
-        assert raised.value.status_code == 400
-        assert raised.value.detail == "conflicting_bip_embedding_nonce"
+        assert raised.value.code == 400
+        assert raised.value.message == "conflicting_bip_embedding_nonce"
+        mock_logging.post_call_failure_hook.assert_awaited_once()
+        failure_data = mock_logging.post_call_failure_hook.await_args.kwargs[
+            "request_data"
+        ]
+        assert failure_data == {}
+        assert all(
+            "X-BIP-Embedding-Nonce" not in str(value)
+            for value in failure_data.values()
+        )
 
 
 class TestRouterModelNameOnStreamingChunks:
