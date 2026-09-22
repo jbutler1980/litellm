@@ -6067,6 +6067,7 @@ def embedding(
     """
     azure: Final = kwargs.get("azure", None)
     client: Final = kwargs.pop("client", None)
+    proxy_forward_headers: Final = kwargs.pop("_proxy_forward_headers", False) is True
     shared_session: Final = kwargs.get("shared_session", None)
     max_retries: Final = kwargs.get("max_retries", None)
     litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
@@ -6751,7 +6752,7 @@ def embedding(
                 aembedding=aembedding,
                 litellm_params={},
             )
-        elif custom_llm_provider == "voyage" or custom_llm_provider == "infinity":
+        elif custom_llm_provider == "voyage":
             response = base_llm_http_handler.embedding(
                 model=model,
                 input=input,
@@ -6765,6 +6766,26 @@ def embedding(
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+            )
+        elif custom_llm_provider == "infinity":
+            response = base_llm_http_handler.embedding(
+                model=model,
+                input=input,
+                custom_llm_provider=custom_llm_provider,
+                api_base=api_base,
+                api_key=api_key,
+                logging_obj=logging,
+                timeout=timeout,
+                model_response=EmbeddingResponse(),
+                optional_params=optional_params,
+                client=client,
+                aembedding=aembedding,
+                litellm_params={},
+                headers=(
+                    {"X-BIP-Embedding-Nonce": headers["X-BIP-Embedding-Nonce"]}
+                    if proxy_forward_headers
+                    else None
+                ),
             )
         elif custom_llm_provider == "watsonx":
             credentials: Final = IBMWatsonXMixin.get_watsonx_credentials(
