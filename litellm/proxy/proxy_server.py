@@ -10372,6 +10372,16 @@ async def embeddings(
 
 """
     global proxy_logging_obj
+    raw_nonce_header_count: Final = sum(
+        1
+        for header_name, _ in request.scope["headers"]
+        if header_name.lower() == b"x-bip-embedding-nonce"
+    )
+    if raw_nonce_header_count > 1:
+        raise HTTPException(
+            status_code=400, detail="conflicting_bip_embedding_nonce"
+        )
+
     data: Final = await _read_request_body(request=request)
     base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:

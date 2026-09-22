@@ -15,7 +15,7 @@ import click
 import httpx
 import pytest
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
@@ -11195,6 +11195,30 @@ class TestEmbeddingsFailureHookRequestData:
         hook_request_data = mock_logging.post_call_failure_hook.await_args.kwargs["request_data"]
         assert hook_request_data is captured["processor_data"]
         assert hook_request_data["litellm_logging_obj"] is logging_obj_sentinel
+
+
+class TestEmbeddingsRejectAmbiguousNonce:
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_raw_nonce_headers_before_body_processing(self):
+        request = Request(
+            {
+                "type": "http",
+                "headers": [
+                    (b"x-bip-embedding-nonce", b"A" * 43),
+                    (b"X-BIP-Embedding-Nonce", b"B" * 43),
+                ],
+            }
+        )
+
+        with pytest.raises(proxy_server_module.HTTPException) as raised:
+            await proxy_server_module.embeddings(
+                request=request,
+                fastapi_response=MagicMock(),
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+
+        assert raised.value.status_code == 400
+        assert raised.value.detail == "conflicting_bip_embedding_nonce"
 
 
 class TestRouterModelNameOnStreamingChunks:
