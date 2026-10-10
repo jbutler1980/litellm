@@ -233,6 +233,28 @@ _STREAMING_ERROR_BODY_READ_EXECUTOR: Final = concurrent.futures.ThreadPoolExecut
 )
 
 
+_BIP_EMBEDDING_NONCE_HEADER: Final = "x-bip-embedding-nonce"
+_BIP_EMBEDDING_NONCE_LENGTH: Final = 43
+_BIP_EMBEDDING_NONCE_ALPHABET: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _carries_bip_embedding_nonce(headers: Mapping[str, str] | None) -> bool:
+    """True when the request carries a well-formed (43 url-safe base64 characters) BIP embedding nonce.
+
+    Only the authenticated qwen3-embedding callback forwards this header. The request it names
+    is paced and accounted at BIP's own attempt boundary, so a transport failure that may have
+    followed backend execution must be returned to that boundary, never replayed here.
+    """
+    if not headers:
+        return False
+    nonce: Final = next((value for name, value in headers.items() if name.lower() == _BIP_EMBEDDING_NONCE_HEADER), None)
+    return (
+        isinstance(nonce, str)
+        and len(nonce) == _BIP_EMBEDDING_NONCE_LENGTH
+        and all(character in _BIP_EMBEDDING_NONCE_ALPHABET for character in nonce)
+    )
+
+
 def _prepare_request_data_and_content(
     data: dict | str | bytes | None = None,
     content: _RequestContent | None = None,
@@ -834,6 +856,10 @@ class AsyncHTTPHandler:
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
+            # A BIP-attested request may already have been executed by the backend: return the
+            # failure to BIP's paced, accounted attempt boundary instead of replaying it here.
+            if _carries_bip_embedding_nonce(headers):
+                raise
             # Retry the request with a new session if there is a connection error
             new_client: Final = self.create_client(timeout=timeout, event_hooks=self.event_hooks)
             try:
