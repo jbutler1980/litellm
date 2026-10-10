@@ -9899,3 +9899,129 @@ class TestErrorLogCarriesCallId:
         record: Final = caplog.records[-1]
         assert record.litellm_call_id == call_id
         assert call_id in record.getMessage()
+
+
+class TestBipAttestedEmbeddingResponseModel:
+    """The OpenAI ``model`` field is restamped to the requested alias, except for the opaque
+    ``bip-attestation-v1.`` carrier that BIP verifies on its authenticated, nonce-bearing
+    qwen3-embedding route. Every other response keeps the ordinary restamp."""
+
+    ATTESTATION: Final = "bip-attestation-v1.offline-payload.offline-signature"
+    NONCE_HEADERS: Final = {"x-bip-embedding-nonce": "offline-request-nonce"}
+
+    @staticmethod
+    async def _response_model(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        route_type: str,
+        requested_model: str,
+        backend_model: str,
+        request_headers: dict[str, str] | None = None,
+    ) -> str:
+        import litellm.proxy.common_request_processing as common
+        from litellm.proxy._types import UserAPIKeyAuth as ProxyUserAPIKeyAuth
+        from litellm.types.utils import EmbeddingResponse
+
+        response = EmbeddingResponse(model=backend_model, data=[], object="list")
+        processor = ProxyBaseLLMRequestProcessing(data={"model": requested_model})
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "offline-recording-backend"
+        logging_obj.model_call_details = {}
+        logging_obj.litellm_params = {}
+        logging_obj.call_type = route_type
+
+        async def pre_call(**_kwargs):
+            return processor.data, logging_obj
+
+        async def route_request(**_kwargs):
+            async def backend_response():
+                return response
+
+            return backend_response()
+
+        proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        proxy_logging_obj.during_call_hook = AsyncMock(return_value=None)
+        proxy_logging_obj.update_request_status = AsyncMock(return_value=None)
+        proxy_logging_obj.post_call_success_hook = AsyncMock(side_effect=lambda **kwargs: kwargs["response"])
+        proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+        monkeypatch.setattr(processor, "_pre_call_with_fallbacks", AsyncMock(side_effect=pre_call))
+        monkeypatch.setattr(common, "route_request", route_request)
+        monkeypatch.setattr(
+            ProxyBaseLLMRequestProcessing, "get_custom_headers", staticmethod(lambda **_kwargs: {})
+        )
+
+        result = await processor.base_process_llm_request(
+            request=Request(
+                {
+                    "type": "http",
+                    "headers": [(k.encode(), v.encode()) for k, v in (request_headers or {}).items()],
+                }
+            ),
+            fastapi_response=Response(),
+            user_api_key_dict=ProxyUserAPIKeyAuth(),
+            route_type=route_type,
+            proxy_logging_obj=proxy_logging_obj,
+            general_settings={},
+            proxy_config=MagicMock(spec=ProxyConfig),
+            llm_router=None,
+            model=None,
+            user_model=None,
+        )
+        return result.model
+
+    @pytest.mark.asyncio
+    async def test_attested_qwen_embedding_model_is_preserved(self, monkeypatch):
+        model = await self._response_model(
+            monkeypatch,
+            route_type="aembedding",
+            requested_model="qwen3-embedding",
+            backend_model=self.ATTESTATION,
+            request_headers=self.NONCE_HEADERS,
+        )
+        assert model == self.ATTESTATION
+
+    @pytest.mark.asyncio
+    async def test_ordinary_qwen_embedding_model_is_still_restamped_to_the_alias(self, monkeypatch):
+        model = await self._response_model(
+            monkeypatch,
+            route_type="aembedding",
+            requested_model="qwen3-embedding",
+            backend_model="michaelfeil/Qwen3-Embedding-8B-auto",
+            request_headers=self.NONCE_HEADERS,
+        )
+        assert model == "qwen3-embedding"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route_type", "requested_model", "request_headers"),
+        [
+            pytest.param("aembedding", "qwen3-embedding", {}, id="qwen-embedding-without-the-nonce-header"),
+            pytest.param(
+                "aembedding", "unrelated-embedding", {"x-bip-embedding-nonce": "n"}, id="unrelated-embedding-alias"
+            ),
+            pytest.param("acompletion", "qwen3-embedding", {"x-bip-embedding-nonce": "n"}, id="non-embedding-route"),
+            pytest.param("acompletion", "qwen-general", {}, id="ordinary-chat-completion"),
+        ],
+    )
+    async def test_the_attestation_prefix_alone_never_exempts_a_response_from_the_restamp(
+        self, monkeypatch, route_type, requested_model, request_headers
+    ):
+        model = await self._response_model(
+            monkeypatch,
+            route_type=route_type,
+            requested_model=requested_model,
+            backend_model=self.ATTESTATION,
+            request_headers=request_headers,
+        )
+        assert model == requested_model
+
+    def test_streaming_chunks_with_the_attestation_prefix_are_still_restamped(self):
+        from litellm.proxy.proxy_server import _restamp_streaming_chunk_model
+
+        chunk, _ = _restamp_streaming_chunk_model(
+            chunk={"model": self.ATTESTATION, "choices": []},
+            requested_model_from_client="qwen3-embedding",
+            request_data={},
+            model_mismatch_logged=False,
+        )
+        assert chunk["model"] == "qwen3-embedding"
