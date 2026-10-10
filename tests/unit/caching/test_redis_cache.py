@@ -1235,7 +1235,7 @@ def test_timeouts_during_a_blip_log_once_per_interval_not_once_per_call(sync_bat
     timeout_records = [r for r in caplog.records if "Timeout reading from" in r.getMessage()]
     assert len(timeout_records) == 201, "every timeout must stay visible at DEBUG"
     assert [r.getMessage() for r in timeout_records if r.levelno >= logging.WARNING] == [
-        "litellm.caching.caching: get() - Got exception from REDIS: Timeout reading from 127.0.0.1:6379"
+        "litellm.caching.caching: get() - Got exception from REDIS: TimeoutError: Timeout reading from 127.0.0.1:6379"
     ]
     assert timeout_records[0].levelno == logging.ERROR
     assert timeout_records[0].filename == "redis_cache.py"
@@ -1248,7 +1248,7 @@ def test_timeouts_during_a_blip_log_once_per_interval_not_once_per_call(sync_bat
     assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
         (
             logging.ERROR,
-            "Error occurred in batch get cache: Timeout reading from 127.0.0.1:6379"
+            "Error occurred in batch get cache: TimeoutError: Timeout reading from 127.0.0.1:6379"
             " (200 more Redis timeouts since the previous Redis timeout line were logged at DEBUG)",
         )
     ]

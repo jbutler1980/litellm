@@ -452,28 +452,70 @@ class _RedisTimeoutLogThrottle:
 _redis_timeout_log_throttle: Final = _RedisTimeoutLogThrottle(REDIS_TIMEOUT_LOG_INTERVAL)
 
 
+# Redis exception text in operator logs is bounded: class name, then a HEAD, then an explicit byte
+# accounting, then a TAIL.
+#
+# redis-py re-wraps EVERY pipelined failure as
+#     Command # N (<the whole command, key and value included>) of pipeline caused error: <reason>
+# so str(e) carries the cached value even where the value argument of the log call is already
+# bounded (a 92,619-byte log line was seen in production from POST /v1/embeddings).
+#
+# HEAD AND TAIL, not head alone: redis puts the reason first on connection errors ("Connection
+# closed by server.", "Timeout reading from host:6379") and LAST on the pipeline shape
+# ("...) of pipeline caused error: READONLY"). 120+60 bytes keeps every observed short Redis error
+# text intact and restores the reason on the pipeline shape. BYTES, not characters: the cut is made
+# on the UTF-8 encoding and decoded back with errors="replace". It must NOT raise: it runs inside
+# `except` handlers whose job is to keep the request alive, so formatting is guarded with
+# `except BaseException` (an adversarial __str__ can raise KeyboardInterrupt) and falls back to a
+# static string.
+#
+# This is a bound, not an erasure: up to 180 bytes of the client's message still print.
+_REDIS_EXC_HEAD_BYTES: Final = 120
+_REDIS_EXC_TAIL_BYTES: Final = 60
+_REDIS_EXC_UNRENDERABLE: Final = "UnrenderableException: <exception could not be rendered>"
+
+
+def _bounded_exception_text(exc: BaseException) -> str:
+    """Bounded, class-tagged rendering of ``exc`` for an operator log; never raises."""
+    try:
+        name: Final = type(exc).__name__
+        raw: Final = str(exc).encode("utf-8", "replace")
+    except BaseException:  # noqa: BLE001  # formatting must never turn a logged cache miss into a failed request
+        return _REDIS_EXC_UNRENDERABLE
+    try:
+        if len(raw) <= _REDIS_EXC_HEAD_BYTES + _REDIS_EXC_TAIL_BYTES:
+            return f"{name}: {raw.decode('utf-8', 'replace')}"
+        head: Final = raw[:_REDIS_EXC_HEAD_BYTES].decode("utf-8", "replace")
+        tail: Final = raw[len(raw) - _REDIS_EXC_TAIL_BYTES :].decode("utf-8", "replace")
+        dropped: Final = len(raw) - _REDIS_EXC_HEAD_BYTES - _REDIS_EXC_TAIL_BYTES
+        return f"{name}: {head} \u2026[truncated {dropped} bytes]\u2026 {tail}"
+    except BaseException:  # noqa: BLE001  # same reason as above
+        return _REDIS_EXC_UNRENDERABLE
+
+
 def log_redis_failure(
     logger: logging.Logger, level: int, message: str, exc: BaseException, with_traceback: bool = False
 ) -> None:
+    exc_text: Final = _bounded_exception_text(exc)
     if isinstance(exc, RedisCircuitBreakerOpenError):
-        logger.debug("%s: %s", message, exc, stacklevel=2)
+        logger.debug("%s: %s", message, exc_text, stacklevel=2)
         return
     exc_info: Final = exc if with_traceback else None
     if not is_redis_timeout_failure(exc):
-        logger.log(level, "%s: %s", message, exc, exc_info=exc_info, stacklevel=2)
+        logger.log(level, "%s: %s", message, exc_text, exc_info=exc_info, stacklevel=2)
         return
     suppressed: Final = _redis_timeout_log_throttle.admit()
     if suppressed is None:
-        logger.debug("%s: %s", message, exc, stacklevel=2)
+        logger.debug("%s: %s", message, exc_text, stacklevel=2)
         return
     if suppressed == 0:
-        logger.log(level, "%s: %s", message, exc, exc_info=exc_info, stacklevel=2)
+        logger.log(level, "%s: %s", message, exc_text, exc_info=exc_info, stacklevel=2)
         return
     logger.log(
         level,
         "%s: %s (%d more Redis timeouts since the previous Redis timeout line were logged at DEBUG)",
         message,
-        exc,
+        exc_text,
         suppressed,
         exc_info=exc_info,
         stacklevel=2,
@@ -660,8 +702,8 @@ class RedisCache(BaseCache):
             else:
                 verbose_logger.error(
                     "Error connecting to Async Redis client - %s",
-                    e,
-                    extra={"error": str(e)},
+                    _bounded_exception_text(e),
+                    extra={"error": _bounded_exception_text(e)},
                 )
                 self._handle_async_ping_error(e)
 
@@ -670,7 +712,7 @@ class RedisCache(BaseCache):
             if hasattr(self.redis_client, "ping"):
                 self.redis_client.ping()
         except Exception as e:
-            verbose_logger.error("Error connecting to Sync Redis client", extra={"error": str(e)})
+            verbose_logger.error("Error connecting to Sync Redis client", extra={"error": _bounded_exception_text(e)})
             self._handle_sync_ping_error(e)
 
     def _handle_async_ping_error(self, e: Exception):
@@ -799,7 +841,7 @@ class RedisCache(BaseCache):
             )
         except Exception as e:
             # NON blocking - notify users Redis is throwing an exception
-            print_verbose(f"litellm.caching.caching: set() - Got exception from REDIS : {e}")
+            print_verbose(f"litellm.caching.caching: set() - Got exception from REDIS : {_bounded_exception_text(e)}")
 
     def increment_cache(self, key, value: int, ttl: float | None = None, **kwargs) -> int:
         _redis_client: Final = self.redis_client
@@ -1620,7 +1662,9 @@ class RedisCache(BaseCache):
                     event_metadata={"key": key},
                 )
             )
-            print_verbose(f"litellm.caching.caching: async get() - Got exception from REDIS: {e}")
+            print_verbose(
+                f"litellm.caching.caching: async get() - Got exception from REDIS: {_bounded_exception_text(e)}"
+            )
             _record_swallowed_redis_failure(self._circuit_breaker, e)
 
     @_redis_circuit_breaker_guard
@@ -1727,7 +1771,9 @@ class RedisCache(BaseCache):
                 error=e,
                 call_type=f"sync_ping <- {_get_call_stack_info()}",
             )
-            verbose_logger.error("LiteLLM Redis Cache PING: - Got exception from REDIS : %s", e)
+            verbose_logger.error(
+                "LiteLLM Redis Cache PING: - Got exception from REDIS : %s", _bounded_exception_text(e)
+            )
             raise e
 
     async def ping(self) -> bool:
@@ -1760,7 +1806,9 @@ class RedisCache(BaseCache):
                     call_type=f"async_ping <- {_get_call_stack_info()}",
                 )
             )
-            verbose_logger.error("LiteLLM Redis Cache PING: - Got exception from REDIS : %s", e)
+            verbose_logger.error(
+                "LiteLLM Redis Cache PING: - Got exception from REDIS : %s", _bounded_exception_text(e)
+            )
             raise e
 
     @_redis_circuit_breaker_guard
@@ -1821,7 +1869,7 @@ class RedisCache(BaseCache):
             else:
                 return {"status": "failed", "message": "Redis ping returned False"}
         except Exception as e:
-            verbose_logger.error("Redis connection test failed: %s", e)
+            verbose_logger.error("Redis connection test failed: %s", _bounded_exception_text(e))
             return {
                 "status": "failed",
                 "message": f"Redis connection failed: {e}",
@@ -1946,7 +1994,7 @@ class RedisCache(BaseCache):
                 return None
             return ttl
         except Exception as e:
-            verbose_logger.debug("Redis TTL Error: %s", e)
+            verbose_logger.debug("Redis TTL Error: %s", _bounded_exception_text(e))
             _record_swallowed_redis_failure(self._circuit_breaker, e)
             return None
 

@@ -676,7 +676,9 @@ async def test_a_real_redis_failure_still_logs_an_error(caplog):
         assert await cache.async_get_cache("k") is None
 
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
-    assert [record.getMessage() for record in errors] == ["LiteLLM Cache: exception in async_get_cache: redis is down"]
+    assert [record.getMessage() for record in errors] == [
+        "LiteLLM Cache: exception in async_get_cache: ConnectionError: redis is down"
+    ]
     assert errors[0].exc_info is not None
 
 
@@ -743,7 +745,7 @@ async def test_redis_timeouts_falling_back_to_memory_log_once_per_interval(caplo
         (
             logging.WARNING,
             "Redis async_increment_cache_pipeline failed, falling back to in-memory result:"
-            " Timeout reading from 127.0.0.1:6379",
+            " TimeoutError: Timeout reading from 127.0.0.1:6379",
         )
     ]
     assert visible[0].filename == "dual_cache.py"
@@ -756,7 +758,8 @@ async def test_redis_timeouts_falling_back_to_memory_log_once_per_interval(caplo
     assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
         (
             logging.WARNING,
-            "Redis async_increment_cache failed, falling back to in-memory result: Timeout reading from 127.0.0.1:6379"
+            "Redis async_increment_cache failed, falling back to in-memory result:"
+            " TimeoutError: Timeout reading from 127.0.0.1:6379"
             " (199 more Redis timeouts since the previous Redis timeout line were logged at DEBUG)",
         )
     ]
