@@ -14624,6 +14624,81 @@ class TestEmbeddingsFailureHookRequestData:
         assert hook_request_data["litellm_logging_obj"] is logging_obj_sentinel
 
 
+class TestEmbeddingsRejectAmbiguousNonce:
+    """A request carrying more than one raw ``x-bip-embedding-nonce`` header is ambiguous: the
+    BIP callback only ever sees a case-folded mapping, so the duplicate has to be rejected from the
+    raw ASGI header list, before the body is read, through the endpoint's own failure path."""
+
+    @staticmethod
+    def _request(raw_headers: list[tuple[bytes, bytes]]) -> Request:
+        return Request({"type": "http", "headers": raw_headers})
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_raw_nonce_headers_through_failure_audit(self):
+        from litellm.proxy._types import ProxyException
+
+        request = self._request(
+            [
+                (b"x-bip-embedding-nonce", b"A" * 43),
+                (b"X-BIP-Embedding-Nonce", b"B" * 43),
+            ]
+        )
+
+        with (
+            patch.object(
+                proxy_server_module,
+                "_read_request_body",
+                new=AsyncMock(side_effect=AssertionError("body must not be read")),
+            ),
+            patch.object(proxy_server_module, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock(return_value=None)
+            mock_logging.post_call_response_headers_hook = AsyncMock(return_value={})
+            with pytest.raises(ProxyException) as raised:
+                await proxy_server_module.embeddings(
+                    request=request,
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=UserAPIKeyAuth(),
+                )
+
+        assert str(raised.value.code) == "400", raised.value.code
+        assert raised.value.message == "conflicting_bip_embedding_nonce", raised.value.message
+        mock_logging.post_call_failure_hook.assert_awaited_once()
+        failure_data = mock_logging.post_call_failure_hook.await_args.kwargs["request_data"]
+        assert failure_data == {}, failure_data
+
+    @pytest.mark.asyncio
+    async def test_a_single_nonce_header_is_not_rejected_and_the_body_is_read(self):
+        from litellm.proxy._types import ProxyException
+
+        request = self._request([(b"X-BIP-Embedding-Nonce", b"A" * 43)])
+        read_body = AsyncMock(return_value={"model": "qwen3-embedding", "input": "hello"})
+
+        async def fake_process(self, **kwargs):
+            raise RuntimeError("stop after the guard")
+
+        with (
+            patch.object(proxy_server_module, "_read_request_body", new=read_body),
+            patch.object(
+                proxy_server_module.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=fake_process,
+            ),
+            patch.object(proxy_server_module, "proxy_logging_obj") as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock(return_value=None)
+            with pytest.raises(ProxyException) as raised:
+                await proxy_server_module.embeddings(
+                    request=request,
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=UserAPIKeyAuth(),
+                )
+
+        read_body.assert_awaited_once()
+        assert "conflicting_bip_embedding_nonce" not in str(raised.value.message), raised.value.message
+        assert raised.value.message == "stop after the guard", raised.value.message
+
+
 @pytest.mark.asyncio
 async def test_authoritative_floor_spend_keeps_a_reset_marker_written_during_the_db_read():
     """A team-member spend reset writes the post-reset floor to the spend_db_floor marker
