@@ -12041,9 +12041,21 @@ async def embeddings(
 
 """
     global proxy_logging_obj
-    data: Final = await _read_request_body(request=request)
+    data: Any = {}
     base_llm_response_processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
+        # Count the raw ASGI headers before Starlette/LiteLLM fold them into a case-insensitive
+        # mapping: the BIP nonce callback only ever sees the folded view, so a duplicate would be
+        # silently collapsed. Stay inside the endpoint's try so a rejected request still reaches
+        # the failure callbacks, and reject before the body is read.
+        raw_nonce_header_count: Final = sum(
+            1 for header_name, _ in request.scope["headers"] if header_name.lower() == b"x-bip-embedding-nonce"
+        )
+        if raw_nonce_header_count > 1:
+            raise HTTPException(status_code=400, detail="conflicting_bip_embedding_nonce")
+
+        data = await _read_request_body(request=request)
+        base_llm_response_processor.data = data
         ### HANDLE TOKEN ARRAY INPUT DECODING ###
         # This must happen BEFORE base_process_llm_request() since it modifies the input
         router_model_names: Final = llm_router.model_names if llm_router is not None else []

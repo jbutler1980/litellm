@@ -6313,6 +6313,10 @@ def embedding(
     """
     azure: Final = kwargs.get("azure", None)
     client: Final = kwargs.pop("client", None)
+    # Private marker set by the proxy-side BIP callback after it validated the request's
+    # X-BIP-Embedding-Nonce header; only the literal `True` counts. Pop it so it never reaches
+    # the provider-specific params.
+    proxy_forward_headers: Final = kwargs.pop("_proxy_forward_headers", False) is True
     shared_session: Final = kwargs.get("shared_session", None)
     max_retries: Final = kwargs.get("max_retries", None)
     litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
@@ -7024,6 +7028,13 @@ def embedding(
                 client=client,
                 aembedding=aembedding,
                 litellm_params={},
+                # Infinity only, and only the one proxy-authorized header: never the caller's
+                # headers. Voyage (same branch) keeps receiving no extra headers.
+                headers=(
+                    {"X-BIP-Embedding-Nonce": headers["X-BIP-Embedding-Nonce"]}
+                    if custom_llm_provider == "infinity" and proxy_forward_headers
+                    else None
+                ),
             )
         elif custom_llm_provider == "watsonx":
             credentials: Final = IBMWatsonXMixin.get_watsonx_credentials(
