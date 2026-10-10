@@ -277,6 +277,36 @@ def _should_return_raw_model_name(request_data: dict[str, object]) -> bool:
     )
 
 
+BIP_ATTESTATION_MODEL_PREFIX: Final = "bip-attestation-v1."
+BIP_ATTESTED_EMBEDDING_ALIAS: Final = "qwen3-embedding"
+BIP_EMBEDDING_NONCE_HEADER: Final = "x-bip-embedding-nonce"
+
+
+def _is_bip_attested_embedding_response(
+    *,
+    route_type: str,
+    requested_model: str,
+    request_headers: Mapping[str, str],
+    response_obj: object,
+) -> bool:
+    """True only for BIP's authenticated, nonce-bearing qwen3-embedding response.
+
+    BIP verifies the opaque `bip-attestation-v1.` carrier the backend returns in the embedding
+    response `model` field, so restamping it to the requested alias would destroy it. The exemption
+    is deliberately narrow so ordinary OpenAI model-name normalisation stays intact everywhere else:
+    the embedding route, the one alias, the nonce header on the request, and the prefix on the
+    response. Embeddings are never streamed, so the streaming restamp is not touched.
+    """
+    if route_type != "aembedding" or requested_model != BIP_ATTESTED_EMBEDDING_ALIAS:
+        return False
+    if request_headers.get(BIP_EMBEDDING_NONCE_HEADER) is None:
+        return False
+    response_model: Final = (
+        response_obj.get("model") if isinstance(response_obj, dict) else getattr(response_obj, "model", None)
+    )
+    return isinstance(response_model, str) and response_model.startswith(BIP_ATTESTATION_MODEL_PREFIX)
+
+
 def _apply_client_disconnect_metadata(target_metadata: dict[str, object] | None) -> None:
     if target_metadata is None:
         return
@@ -2910,7 +2940,12 @@ class ProxyBaseLLMRequestProcessing:
 
         # Always return the client-requested model name (not provider-prefixed internal identifiers)
         # for OpenAI-compatible responses.
-        if requested_model_from_client:
+        if requested_model_from_client and not _is_bip_attested_embedding_response(
+            route_type=route_type,
+            requested_model=requested_model_from_client,
+            request_headers=request.headers,
+            response_obj=response,
+        ):
             _override_openai_response_model(
                 response_obj=response,
                 requested_model=requested_model_from_client,
